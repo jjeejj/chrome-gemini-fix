@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""
+Chrome "Gemini in Chrome isn't available" 修复工具
+
+背景
+----
+Gemini 侧边栏（内部代号 Glic）的地域门禁读的是 Chrome 的两个本地状态：
+  Local State -> variations_country                  必须是 us
+  Local State -> profile.info_cache.*.is_glic_eligible  必须是 true
+
+问题在于 Chrome 每次启动后都会从 Google 的 variations seed 把这两个值改写回去
+（即使出口 IP 在美国、即使加了 --variations-override-country=us）。
+实测：改完能短暂生效，几十秒内被覆写回 cn / false。
+
+解决办法
+--------
+两个条件必须同时满足，缺一不可：
+
+  1. Local State 锁成不可写（chflags uchg），阻止 Chrome 把
+     variations_country / is_glic_eligible 覆写回 cn / false
+  2. Chrome 必须带 --variations-override-country=us 启动
+
+实测对照：
+  * 只有锁、不带开关 -> Preferences 里的 glic.previously_not_allowed 在 20 秒内翻回 true，
+    侧边栏依旧显示 "isn't available"
+  * 锁 + 带开关     -> previously_not_allowed 稳定保持 false，侧边栏可用
+
+因为条件 2 只有启动时能传参，所以 Chrome 不能直接双击启动，
+要用 `glic launch` 或桌面上的「Chrome (Gemini)」启动图标。
+
+代价（重要）
+------------
+锁定期间 Chrome 无法写 Local State，副作用是：
+  * chrome://flags 里改任何开关都不会被保存（enabled_labs_experiments 在这个文件里）
+  * Chrome 全局设置（上次用的 profile、部分 UI 状态、崩溃恢复信息）不会持久化
+书签 / 历史 / 密码 / Cookie / 扩展都在 profile 目录里，完全不受影响。
+
+所以要改 chrome://flags 时，走这个顺序：
+  1. python3 chrome-gemini-fix.py unlock
+  2. 打开 Chrome，改 flags，完全退出
+  3. python3 chrome-gemini-fix.py apply
+apply 只删 variations_* 字段，不会动你已经设置的 flags。
+
+用法
+----
+安装后就是一个 shell 命令 `glic`：
+
+  glic            # 等同 glic status，看当前状态（Chrome 开着也能跑）
+  glic status     # 同上
+  glic launch     # 带 override 开关启动 Chrome（Chrome 必须先是关着的）
+  glic apply      # 退出 Chrome -> 修复 -> 锁定 -> 用 launch 方式启动（= glic on）
+  glic unlock     # 解锁还原（= glic off）
+  glic -h         # 帮助
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+CHROME_DIR = os.path.expanduser("~/Library/Application Support/Google/Chrome")
+LOCAL_STATE = os.path.join(CHROME_DIR, "Local State")
+CHROME_BIN = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+TS = time.strftime("%Y%m%d-%H%M%S")
+
+KEEP_VARIATIONS = {"variations_country", "variations_permanent_consistency_country"}
+
+# Chromium 的 CountryId 编码 = (首字母 << 8) | 次字母
+COUNTRY_ID_CN = 17230   # "CN"
+COUNTRY_ID_US = 21843   # "US"
+
+
+# ---------- 基础工具 ----------
+
+def chrome_running():
+    r = subprocess.run(["pgrep", "-f", CHROME_BIN], capture_output=True, text=True)
+    return bool(r.stdout.strip())
+
+
+def quit_chrome():
+    if not chrome_running():
+        return True
+    # 用 SIGTERM 触发正常退出；osascript quit 会被「确认退出」对话框卡住
+    pid = subprocess.run(["pgrep", "-f", CHROME_BIN], capture_output=True, text=True).stdout.split()
+    if not pid:
+        return True
+    subprocess.run(["kill", "-TERM", pid[0]])
+    for _ in range(30):
+        if not chrome_running():
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def is_locked(path):
+    r = subprocess.run(["ls", "-lO", path], capture_output=True, text=True)
+    return "uchg" in r.stdout
+
+
+def set_lock(path, lock):
+    subprocess.run(["chflags", "uchg" if lock else "nouchg", path])
+
+
+def load(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save(path, data):
+    tmp = path + ".tmp-fix"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, separators=(",", ":"), ensure_ascii=False)
+    shutil.copymode(path, tmp)
+    os.replace(tmp, path)
+
+
+def chrome_version():
+    r = subprocess.run(
+        ["/usr/libexec/PlistBuddy", "-c", "Print :CFBundleShortVersionString",
+         "/Applications/Google Chrome.app/Contents/Info.plist"],
+        capture_output=True, text=True,
+    )
+    return r.stdout.strip()
+
+
+# ---------- 命令 ----------
+
+def cmd_launch():
+    """带 override 开关启动 Chrome。这是唯一正确的启动方式。"""
+    if chrome_running():
+        print("Chrome 已经在运行 —— 开关传不进去（open --args 对已运行实例无效）。")
+        print("请先 Cmd+Q 完全退出，或直接跑 glic apply（会自动处理）。")
+        return False
+
+    # 直接 exec 二进制，参数 100% 传得进去；start_new_session 让它脱离父进程
+    subprocess.Popen([CHROME_BIN, "--variations-override-country=us"],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    for _ in range(10):
+        time.sleep(1)
+        if subprocess.run(["pgrep", "-f", "variations-override-country=us"],
+                          capture_output=True).returncode == 0:
+            print("Chrome 已启动，override 开关生效。")
+            return True
+    print("启动失败：没检测到 override 开关。")
+    print("请手动在终端执行：")
+    print(f'  "{CHROME_BIN}" --variations-override-country=us &')
+    return False
+
+
+def cmd_status():
+    if not os.path.exists(LOCAL_STATE):
+        sys.exit("找不到 Local State，Chrome 数据目录路径不对。")
+    d = load(LOCAL_STATE)
+    print("Chrome 版本        :", chrome_version())
+    print("Chrome 进程        :", "运行中" if chrome_running() else "未运行")
+    print("Local State 锁定   :", "已锁定 uchg" if is_locked(LOCAL_STATE) else "未锁定")
+    over = subprocess.run(["pgrep", "-f", "variations-override-country=us"],
+                          capture_output=True).returncode == 0
+    print("override 开关      :", "已生效" if over else
+          ("Chrome 未运行（下次用 glic launch 启动）" if not chrome_running() else "未生效  <-- 会失效"))
+    na = "<读不到>"
+    pref = os.path.join(CHROME_DIR, "Default", "Preferences")
+    if os.path.exists(pref):
+        try:
+            na = (load(pref).get("glic") or {}).get("previously_not_allowed")
+        except Exception:
+            pass
+    print("previously_not_allowed:", na, "  <-- 必须是 None 或 False")
+    print()
+    print("variations_country :", d.get("variations_country"), "  <-- 必须是 us")
+    print("enabled flags      :", d.get("browser", {}).get("enabled_labs_experiments"))
+    print()
+    print("各 profile 资格缓存：")
+    ok = True
+    for name, info in (d.get("profile", {}).get("info_cache", {}) or {}).items():
+        v = info.get("is_glic_eligible")
+        if v is not True:
+            ok = False
+        print(f"  {name:14s} is_glic_eligible = {v}")
+    print()
+    vc = (d.get("variations_country") or "").lower()
+    locked = is_locked(LOCAL_STATE)
+    if vc == "us" and ok and locked and na in (None, False) and (over or not chrome_running()):
+        print("状态：正常。国家已固定 + override 生效，侧边栏可用。")
+    elif vc != "us" or not ok or not locked:
+        print("状态：未生效。跑 glic apply 修复。")
+    elif not over and chrome_running():
+        print("状态：Chrome 不是带 override 开关启动的，现在大概是失效的。")
+        print("      完全退出 Chrome 后跑 glic launch（或直接 glic apply）。")
+    else:
+        print("状态：previously_not_allowed 被置成 true 了，跑 glic apply 重置。")
+
+
+def cmd_apply(relaunch=True):
+    version = chrome_version()
+    print("Chrome 版本:", version)
+
+    if chrome_running():
+        print("正在退出 Chrome ...")
+        if not quit_chrome():
+            sys.exit("Chrome 没能退出，可能卡在确认对话框，请手动处理后再跑。")
+
+    was_locked = is_locked(LOCAL_STATE)
+    if was_locked:
+        set_lock(LOCAL_STATE, False)
+
+    # 备份（只在没有同日备份时留一份，避免刷屏）
+    bak = f"{LOCAL_STATE}.bak.{TS}"
+    shutil.copy2(LOCAL_STATE, bak)
+    print("已备份:", bak)
+    print("备份会越积越多，确认没问题后可以自行删掉旧的 .bak.*")
+
+    d = load(LOCAL_STATE)
+
+    # 1) 丢掉整份 variations seed，避免旧 seed 参与判定
+    dropped = [k for k in list(d) if k.startswith("variations_") and k not in KEEP_VARIATIONS]
+    for k in dropped:
+        del d[k]
+
+    # 2) 国家固定 us
+    d["variations_country"] = "us"
+    d["variations_permanent_consistency_country"] = [version, "us"]
+
+    # 3) 资格缓存置真
+    for info in (d.get("profile", {}).get("info_cache", {}) or {}).values():
+        info["is_glic_eligible"] = True
+
+    # 4) 启动器开关
+    d.setdefault("glic", {})["launcher_enabled"] = True
+
+    save(LOCAL_STATE, d)
+    print(f"已写入: variations_country=us, 丢弃 seed 字段 {len(dropped)} 个, is_glic_eligible 全部 true")
+
+    # 5) 各 profile 的负面缓存
+    for name in sorted(os.listdir(CHROME_DIR)):
+        if not (name == "Default" or name.startswith("Profile")):
+            continue
+        pref = os.path.join(CHROME_DIR, name, "Preferences")
+        if not os.path.exists(pref):
+            continue
+        try:
+            pd = load(pref)
+        except Exception as e:
+            print(f"  跳过 {name}: {e}")
+            continue
+        changed = []
+        if pd.get("countryid_at_install") == COUNTRY_ID_CN:
+            pd["countryid_at_install"] = COUNTRY_ID_US
+            changed.append("countryid_at_install CN->US")
+        g = pd.get("glic")
+        if isinstance(g, dict):
+            if g.pop("previously_not_allowed", None) is not None:
+                changed.append("移除 previously_not_allowed")
+            en = g.get("profile_enablement")
+            if isinstance(en, dict) and en.get("last_ready_state") != 5:
+                en["last_ready_state"] = 5
+                changed.append("last_ready_state -> 5")
+        if changed:
+            shutil.copy2(pref, f"{pref}.bak.{TS}")
+            save(pref, pd)
+            print(f"  [{name}] " + ", ".join(changed))
+
+    # 6) 锁定
+    set_lock(LOCAL_STATE, True)
+    print("已锁定 Local State（uchg）—— Chrome 从此改不动这两个字段")
+
+    if relaunch:
+        cmd_launch()
+
+
+def cmd_unlock():
+    if chrome_running():
+        print("正在退出 Chrome ...")
+        if not quit_chrome():
+            sys.exit("Chrome 没能退出，请手动处理。")
+    set_lock(LOCAL_STATE, False)
+    print("已解锁 Local State，Chrome 恢复正常的设置持久化。")
+    print("注意：下次启动 Chrome 时 variations_country 会被 Google 改回 cn，侧边栏会再次不可用。")
+    if input("现在启动 Chrome 吗？[y/N] ").strip().lower() == "y":
+        subprocess.run(["open", "-a", "Google Chrome"])
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="glic",
+        description="修复 / 维护 Chrome 的 Gemini 侧边栏（Glic）。不带参数时等同 status。",
+        epilog="示例：glic status | glic apply（= glic on） | glic unlock（= glic off）",
+    )
+    ap.add_argument("action", nargs="?", default="status",
+                    choices=["status", "apply", "unlock", "launch", "on", "off"])
+    ap.add_argument("--no-launch", action="store_true", help="apply 后不自动启动 Chrome")
+    a = ap.parse_args()
+
+    if not os.path.exists(LOCAL_STATE):
+        sys.exit("找不到 Local State。")
+
+    action = {"on": "apply", "off": "unlock"}.get(a.action, a.action)
+
+    if action == "status":
+        cmd_status()
+    elif action == "apply":
+        cmd_apply(relaunch=not a.no_launch)
+    elif action == "unlock":
+        cmd_unlock()
+    elif action == "launch":
+        sys.exit(0 if cmd_launch() else 1)
+
+
+if __name__ == "__main__":
+    main()

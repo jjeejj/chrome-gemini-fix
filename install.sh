@@ -2,15 +2,32 @@
 #
 # install.sh —— 安装 glic 命令 + 「Chrome (Gemini)」启动图标
 #
-# 用法：
-#   ./install.sh              安装
-#   ./install.sh --uninstall  卸载
+# 三种用法：
+#
+#   1) 本地（git clone 之后）
+#        ./install.sh
+#
+#   2) 远程直接执行（无需 clone，仓库私有，走 gh 的登录态）
+#        gh api repos/jjeejj/chrome-gemini-fix/contents/install.sh \
+#          --jq .content | base64 -D | bash
+#
+#   3) 卸载
+#        ./install.sh --uninstall
+#        # 或远程：
+#        gh api repos/jjeejj/chrome-gemini-fix/contents/install.sh \
+#          --jq .content | base64 -D | bash -s -- --uninstall
+#
+# 可用环境变量覆盖：
+#   GLIC_REPO  默认 jjeejj/chrome-gemini-fix
+#   GLIC_REF   默认 main
 #
 # 安装后先别急着打开 Chrome，跑一次  glic apply  完成字段修复和加锁。
 
 set -euo pipefail
 
-GLIC_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/glic"
+REPO="${GLIC_REPO:-jjeejj/chrome-gemini-fix}"
+REF="${GLIC_REF:-main}"
+
 GLIC_DST="$HOME/.local/bin/glic"
 APP="$HOME/Applications/Chrome (Gemini).app"
 CHROME="/Applications/Google Chrome.app"
@@ -21,29 +38,101 @@ ok()   { printf '\033[32m✓\033[0m %s\n' "$1"; }
 warn() { printf '\033[33m!\033[0m %s\n' "$1"; }
 die()  { printf '\033[31m✗\033[0m %s\n' "$1" >&2; exit 1; }
 
-# ---------- 卸载 ----------
+# 定位脚本所在目录；管道执行时 BASH_SOURCE 为空
+SCRIPT_DIR=""
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]:-}" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+
+# ---------- 卸载（不需要 glic，先处理） ----------
 if [ "${1:-}" = "--uninstall" ]; then
   info "解除 Local State 锁定（如果已锁）"
   LS="$HOME/Library/Application Support/Google/Chrome/Local State"
   if [ -f "$LS" ]; then
     if pgrep -f "MacOS/Google Chrome" >/dev/null 2>&1; then
-      warn "Chrome 正在运行，先退出再卸载，否则锁定可能被写回"
+      warn "Chrome 正在运行，先退出，否则锁定可能被写回"
       osascript -e 'tell application "Google Chrome" to quit' 2>/dev/null || true
-      sleep 2
+      sleep 3
+      pkill -f "MacOS/Google Chrome" 2>/dev/null || true
+      sleep 1
     fi
-    chflags nouchg "$LS" 2>/dev/null && ok "已解锁 Local State" || warn "解锁失败或本来就未锁"
+    if chflags nouchg "$LS" 2>/dev/null; then
+      ok "已解锁 Local State"
+    else
+      warn "解锁失败或本来就未锁"
+    fi
   fi
   rm -rf "$APP" && ok "已删除启动图标"
   rm -f "$GLIC_DST" && ok "已删除 glic 命令"
-  info "卸载完成。Chrome 会自动恢复写入配置（相对地，Gemini 侧边栏也会失效）"
+  info "卸载完成。Chrome 恢复写配置（Gemini 侧边栏随之失效）"
+  exit 0
+fi
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  cat <<'EOM'
+install.sh —— 安装 glic 命令 + 「Chrome (Gemini)」启动图标
+
+用法：
+  ./install.sh                 本地安装（需同目录有 glic）
+  ./install.sh --uninstall     卸载（解锁 + 删除图标和命令）
+
+远程执行（无需 clone）：
+  gh api repos/jjeejj/chrome-gemini-fix/contents/install.sh \
+    --jq .content | base64 -D | bash
+
+环境变量：
+  GLIC_REPO   默认 jjeejj/chrome-gemini-fix
+  GLIC_REF    默认 main
+
+安装后需执行一次 glic apply 完成修复和加锁。
+EOM
   exit 0
 fi
 
 # ---------- 前置检查 ----------
 [ "$(uname -s)" = "Darwin" ] || die "只支持 macOS"
 [ -x "$CHROME_BIN" ] || die "找不到 Google Chrome，请确认装在 /Applications"
-[ -f "$GLIC_SRC" ] || die "找不到同目录下的 glic 脚本"
 command -v python3 >/dev/null 2>&1 || die "需要 python3"
+
+# ---------- 取得 glic ----------
+GLIC_SRC="$SCRIPT_DIR/glic"
+TMPD=""
+cleanup() { [ -n "$TMPD" ] && rm -rf "$TMPD"; }
+trap cleanup EXIT
+
+if [ ! -f "$GLIC_SRC" ]; then
+  info "本地没有 glic，进入远程模式从 $REPO@$REF 拉取"
+  TMPD="$(mktemp -d)"
+  GLIC_SRC="$TMPD/glic"
+
+  fetch_ok=0
+  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    if gh api "repos/$REPO/contents/glic?ref=$REF" --jq .content 2>/dev/null \
+         | base64 -D > "$GLIC_SRC" 2>/dev/null && [ -s "$GLIC_SRC" ]; then
+      fetch_ok=1
+      ok "已通过 gh 拉取 glic（私有仓库）"
+    fi
+  fi
+
+  if [ "$fetch_ok" -eq 0 ]; then
+    if curl -fsSL "https://raw.githubusercontent.com/$REPO/$REF/glic" -o "$GLIC_SRC" 2>/dev/null \
+         && [ -s "$GLIC_SRC" ]; then
+      fetch_ok=1
+      ok "已通过 curl 拉取 glic（公开仓库）"
+    fi
+  fi
+
+  if [ "$fetch_ok" -eq 0 ]; then
+    die "拉取 glic 失败。仓库是私有的，需要先登录 gh：gh auth login
+   或者改为公开仓库后即可用 curl 方式。
+   也可以直接 git clone 后本地执行 ./install.sh"
+  fi
+
+  # 简单校验，避免把半截内容装进去
+  head -1 "$GLIC_SRC" | grep -q '^#!.*python3' || die "拉取到的 glic 内容不合法（首行不是 python shebang）"
+  python3 -m py_compile "$GLIC_SRC" 2>/dev/null || die "拉取到的 glic 语法检查失败"
+  ok "glic 内容校验通过"
+fi
 
 # ---------- 安装 glic ----------
 mkdir -p "$HOME/.local/bin"
@@ -97,12 +186,10 @@ cat > "$APP/Contents/Info.plist" <<'EOP'
 EOP
 
 # 图标直接复用本机 Chrome 的资源，不把 Google 的美术资源塞进仓库
-if [ -f "$CHROME/Contents/Resources/Assets.car" ]; then
+[ -f "$CHROME/Contents/Resources/Assets.car" ] && \
   cp "$CHROME/Contents/Resources/Assets.car" "$APP/Contents/Resources/Assets.car"
-fi
-if [ -f "$CHROME/Contents/Resources/app.icns" ]; then
+[ -f "$CHROME/Contents/Resources/app.icns" ] && \
   cp "$CHROME/Contents/Resources/app.icns" "$APP/Contents/Resources/AppIcon.icns"
-fi
 
 plutil -lint "$APP/Contents/Info.plist" >/dev/null || die "Info.plist 校验失败"
 touch "$APP"

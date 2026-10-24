@@ -26,13 +26,31 @@ Chrome 的地域门禁读的是**本地两个字段**，而 Chrome 每次启动�
 
 ## 快速开始
 
+### 方式一：一行远程安装（不需要 clone）
+
+仓库是私有的，用 `gh` 的登录态取内容（前提：`gh auth login` 过）：
+
 ```bash
-git clone <this-repo> chrome-gemini-fix
+gh api repos/jjeejj/chrome-gemini-fix/contents/install.sh \
+  --jq .content | base64 -D | bash
+```
+
+它会在安装时自动把 `glic` 也从仓库拉下来，并做首行 shebang 检查和语法编译校验。
+
+> 如果仓库改为**公开**，就可以用更通用的写法：
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/jjeejj/chrome-gemini-fix/main/install.sh | bash
+> ```
+
+### 方式二：clone 后本地安装
+
+```bash
+git clone git@github.com:jjeejj/chrome-gemini-fix.git
 cd chrome-gemini-fix
 ./install.sh
 ```
 
-安装脚本会：
+### 两种方式都会做
 
 - 把 `glic` 装到 `~/.local/bin/`
 - 生成 `~/Applications/Chrome (Gemini).app`（图标复用本机 Chrome 的资源）
@@ -46,6 +64,8 @@ glic apply
 ```
 
 此后**只用「Chrome (Gemini)」图标或 `glic launch` 启动 Chrome**，直接点原版 Chrome 会失效。
+
+> `install.sh` 支持 `GLIC_REPO` / `GLIC_REF` 环境变量，可以指定别的仓库或分支。
 
 ---
 
@@ -91,7 +111,12 @@ glic apply                  # 重新修复 + 加锁 + 带开关启动
 ## 卸载
 
 ```bash
+# clone 过的
 ./install.sh --uninstall
+
+# 没 clone 的（远程一行）
+gh api repos/jjeejj/chrome-gemini-fix/contents/install.sh \
+  --jq .content | base64 -D | bash -s -- --uninstall
 ```
 
 会解除锁定、删除启动图标和 `glic` 命令。Chrome 恢复正常写配置（Gemini 侧边栏随之失效）。

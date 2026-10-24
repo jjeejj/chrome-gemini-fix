@@ -77,8 +77,9 @@ install.sh —— 安装 glic 命令 + 「Chrome (Gemini)」启动图标
   ./install.sh --uninstall     卸载（解锁 + 删除图标和命令）
 
 远程执行（无需 clone）：
-  gh api repos/jjeejj/chrome-gemini-fix/contents/install.sh \
-    --jq .content | base64 -D | bash
+  curl -fsSL https://raw.githubusercontent.com/jjeejj/chrome-gemini-fix/main/install.sh | bash
+  # 卸载：
+  curl -fsSL https://raw.githubusercontent.com/jjeejj/chrome-gemini-fix/main/install.sh | bash -s -- --uninstall
 
 环境变量：
   GLIC_REPO   默认 jjeejj/chrome-gemini-fix
